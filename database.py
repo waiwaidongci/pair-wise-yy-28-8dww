@@ -16,7 +16,7 @@ RULES = {"stable", "monotonic", "allowed"}
 
 
 class ContinuityDB:
-    """Non-linear film continuity checker with reviewable corrections."""
+    """Non-linear film continuity checker with versioned reshoot states."""
 
     def __init__(self, path: str = "continuity.db") -> None:
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -70,7 +70,8 @@ class ContinuityDB:
               shoot_order INTEGER NOT NULL CHECK(shoot_order > 0),
               narrative_order INTEGER NOT NULL CHECK(narrative_order > 0),
               description TEXT NOT NULL DEFAULT '',
-              status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','locked')),
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','locked')),
+              status_note TEXT NOT NULL DEFAULT '',
               version INTEGER NOT NULL DEFAULT 0,
               updated_by INTEGER NOT NULL REFERENCES users(id),
               updated_at TEXT NOT NULL,
@@ -98,13 +99,21 @@ class ContinuityDB:
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               shot_id INTEGER NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
               element_id INTEGER NOT NULL REFERENCES elements(id) ON DELETE CASCADE,
+              version INTEGER NOT NULL CHECK(version > 0),
               state_value TEXT NOT NULL,
               numeric_value REAL,
               note TEXT NOT NULL DEFAULT '',
+              shoot_date TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              source TEXT NOT NULL DEFAULT 'manual' CHECK(source IN ('manual','plan')),
+              plan_id INTEGER REFERENCES adjustment_plans(id),
+              status TEXT NOT NULL DEFAULT 'enabled' CHECK(status IN ('enabled','superseded')),
               updated_by INTEGER NOT NULL REFERENCES users(id),
               updated_at TEXT NOT NULL,
-              UNIQUE(shot_id,element_id)
+              UNIQUE(shot_id,element_id,version)
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS element_states_one_enabled
+              ON element_states(shot_id,element_id) WHERE status='enabled';
             CREATE TABLE IF NOT EXISTS conflicts (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               scene_id INTEGER NOT NULL REFERENCES scenes(id) ON DELETE CASCADE,
@@ -113,6 +122,8 @@ class ContinuityDB:
               to_shot_id INTEGER NOT NULL REFERENCES shots(id),
               kind TEXT NOT NULL,
               detail TEXT NOT NULL,
+              from_version INTEGER,
+              to_version INTEGER,
               status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','exempted','resolved')),
               active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
               fingerprint TEXT NOT NULL UNIQUE,
@@ -127,6 +138,7 @@ class ContinuityDB:
               new_value TEXT NOT NULL,
               numeric_value REAL,
               reason TEXT NOT NULL,
+              shoot_date TEXT NOT NULL DEFAULT '',
               proposed_by INTEGER NOT NULL REFERENCES users(id),
               status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
               reviewed_by INTEGER REFERENCES users(id),
@@ -140,6 +152,16 @@ class ContinuityDB:
               reason TEXT NOT NULL,
               approved_by INTEGER NOT NULL REFERENCES users(id),
               approved_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS shot_locks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              shot_id INTEGER NOT NULL REFERENCES shots(id) ON DELETE CASCADE,
+              shot_version INTEGER NOT NULL,
+              locked_by INTEGER NOT NULL REFERENCES users(id),
+              locked_at TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released')),
+              released_reason TEXT NOT NULL DEFAULT '',
+              released_at TEXT
             );
             """
         )
@@ -156,8 +178,9 @@ class ContinuityDB:
         s01 = self.add_shot(scene, "S01-01", 2, 1, "角色受伤后", continuity)
         s02 = self.add_shot(scene, "S01-02", 1, 2, "角色尚未受伤", continuity)
         injury = self.add_element(production, "主角左臂伤痕", "injury", "monotonic", "伤痕严重程度只能递增")
-        self.set_element_state(s01, injury, "重度", 3, "", continuity)
-        self.set_element_state(s02, injury, "轻度", 1, "", continuity)
+        self.set_element_state(s01, injury, "中度", 2, "", continuity, "2026-09-20", "首次录入")
+        self.set_element_state(s01, injury, "重度", 3, "", continuity, "2026-09-22", "补拍：伤痕妆加重")
+        self.set_element_state(s02, injury, "轻度", 1, "", continuity, "2026-09-21", "首次录入")
         self.check_scene(scene)
 
     def add_user(self, name: str, role: str) -> int:
@@ -256,8 +279,63 @@ class ContinuityDB:
                 raise DomainError("该状态转移已存在") from exc
         return int(cur.lastrowid)
 
+    @staticmethod
+    def _check_shoot_date(shoot_date: str) -> str:
+        try:
+            return datetime.strptime(str(shoot_date).strip(), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            raise DomainError("拍摄日必须按 YYYY-MM-DD 填写")
+
+    def _next_state_version(self, shot_id: int, element_id: int) -> int:
+        return int(self.conn.execute(
+            "SELECT COALESCE(MAX(version),0)+1 FROM element_states WHERE shot_id=? AND element_id=?",
+            (shot_id, element_id),
+        ).fetchone()[0])
+
+    def _bump_shot_version(self, shot_id: int, user_id: int) -> int:
+        self.conn.execute(
+            "UPDATE shots SET version=version+1,updated_by=?,updated_at=? WHERE id=?",
+            (user_id, datetime.now().isoformat(), shot_id),
+        )
+        return int(self.conn.execute("SELECT version FROM shots WHERE id=?", (shot_id,)).fetchone()[0])
+
+    def _record_state_version(self, shot: sqlite3.Row, element_id: int, state_value: str,
+                              numeric_value: float | None, note: str, shoot_date: str, reason: str,
+                              source: str, plan_id: int | None, user_id: int) -> tuple[int, int]:
+        """Archive the current enabled version and append a new enabled one."""
+        version = self._next_state_version(shot["id"], element_id)
+        self.conn.execute(
+            "UPDATE element_states SET status='superseded' WHERE shot_id=? AND element_id=? AND status='enabled'",
+            (shot["id"], element_id),
+        )
+        self.conn.execute(
+            "INSERT INTO element_states(shot_id,element_id,version,state_value,numeric_value,note,shoot_date,reason,source,plan_id,status,updated_by,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,'enabled',?,?)",
+            (shot["id"], element_id, version, state_value, numeric_value, note, shoot_date, reason,
+             source, plan_id, user_id, datetime.now().isoformat()),
+        )
+        return version, self._bump_shot_version(shot["id"], user_id)
+
+    def _release_scene_locks(self, scene_id: int, reason: str) -> int:
+        """A new version invalidates every active lock in the scene; history stays queryable."""
+        now = datetime.now().isoformat()
+        active = self.conn.execute(
+            "SELECT l.id,l.shot_id FROM shot_locks l JOIN shots s ON s.id=l.shot_id "
+            "WHERE s.scene_id=? AND l.status='active'", (scene_id,)
+        ).fetchall()
+        for lock in active:
+            self.conn.execute(
+                "UPDATE shot_locks SET status='released',released_reason=?,released_at=? WHERE id=?",
+                (reason, now, lock["id"]),
+            )
+            self.conn.execute(
+                "UPDATE shots SET status='pending',status_note=? WHERE id=?",
+                (reason, lock["shot_id"]),
+            )
+        return len(active)
+
     def set_element_state(self, shot_id: int, element_id: int, state_value: str, numeric_value: float | None,
-                          note: str, user_id: int) -> dict:
+                          note: str, user_id: int, shoot_date: str, reason: str) -> dict:
         shot = self.conn.execute("SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)).fetchone()
         element = self.conn.execute("SELECT * FROM elements WHERE id=?", (element_id,)).fetchone()
         if not shot or not element or shot["production_id"] != element["production_id"]:
@@ -265,27 +343,47 @@ class ContinuityDB:
         user = self._production_for_user(shot["production_id"], user_id)
         if user["role"] not in {"producer", "continuity"}:
             raise DomainError("无权修改连续性状态")
-        if shot["status"] == "locked":
-            raise DomainError("镜头已锁定，不能直接修改状态")
         if not state_value.strip():
             raise DomainError("状态值不能为空")
         if element["rule"] == "monotonic" and numeric_value is None:
             raise DomainError("单调规则必须提供 numeric_value")
+        if not reason.strip():
+            raise DomainError("每次状态提交必须写清替换原因")
+        shoot_date = self._check_shoot_date(shoot_date)
+        pending = self.conn.execute(
+            "SELECT id FROM adjustment_plans WHERE shot_id=? AND element_id=? AND status='pending'",
+            (shot_id, element_id),
+        ).fetchone()
+        if pending:
+            raise DomainError(f"调整方案 #{pending['id']} 审核期间不接收新版本")
         with self.transaction():
-            try:
-                self.conn.execute(
-                    "INSERT INTO element_states(shot_id,element_id,state_value,numeric_value,note,updated_by,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (shot_id, element_id, state_value.strip(), numeric_value, note.strip(), user_id, datetime.now().isoformat()),
-                )
-            except sqlite3.IntegrityError:
-                self.conn.execute(
-                    "UPDATE element_states SET state_value=?,numeric_value=?,note=?,updated_by=?,updated_at=? WHERE shot_id=? AND element_id=?",
-                    (state_value.strip(), numeric_value, note.strip(), user_id, datetime.now().isoformat(), shot_id, element_id),
-                )
-            self.conn.execute("UPDATE shots SET version=version+1,updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), shot_id))
+            version, shot_version = self._record_state_version(
+                shot, element_id, state_value.strip(), numeric_value, note.strip(),
+                shoot_date, reason.strip(), "manual", None, user_id,
+            )
+            released = self._release_scene_locks(
+                shot["scene_id"], f"镜头 {shot['shot_code']} 提交补拍版本 v{version}：{reason.strip()}"
+            )
             self._sync_conflicts(shot["scene_id"])
-        return {"shot_id": shot_id, "element_id": element_id, "conflicts": self.list_conflicts(shot["scene_id"])}
+        return {"shot_id": shot_id, "element_id": element_id, "version": version, "shot_version": shot_version,
+                "released_locks": released, "conflicts": self.list_conflicts(shot["scene_id"])}
+
+    def list_shot_versions(self, shot_id: int) -> list[dict]:
+        if not self.conn.execute("SELECT 1 FROM shots WHERE id=?", (shot_id,)).fetchone():
+            raise DomainError("镜头不存在")
+        return [dict(row) for row in self.conn.execute(
+            "SELECT es.*,e.name AS element_name,u.name AS updated_by_name FROM element_states es "
+            "JOIN elements e ON e.id=es.element_id JOIN users u ON u.id=es.updated_by "
+            "WHERE es.shot_id=? ORDER BY es.element_id,es.version DESC", (shot_id,)
+        ).fetchall()]
+
+    def list_shot_locks(self, shot_id: int) -> list[dict]:
+        if not self.conn.execute("SELECT 1 FROM shots WHERE id=?", (shot_id,)).fetchone():
+            raise DomainError("镜头不存在")
+        return [dict(row) for row in self.conn.execute(
+            "SELECT l.*,u.name AS locked_by_name FROM shot_locks l JOIN users u ON u.id=l.locked_by "
+            "WHERE l.shot_id=? ORDER BY l.id DESC", (shot_id,)
+        ).fetchall()]
 
     def _detect_conflicts(self, scene_id: int) -> list[dict]:
         scene = self.conn.execute("SELECT * FROM scenes WHERE id=?", (scene_id,)).fetchone()
@@ -300,7 +398,8 @@ class ContinuityDB:
             sequence = []
             for shot in shots:
                 state = self.conn.execute(
-                    "SELECT * FROM element_states WHERE shot_id=? AND element_id=?", (shot["id"], element["id"])
+                    "SELECT * FROM element_states WHERE shot_id=? AND element_id=? AND status='enabled'",
+                    (shot["id"], element["id"])
                 ).fetchone()
                 if state:
                     sequence.append((shot, state))
@@ -332,6 +431,7 @@ class ContinuityDB:
                         "scene_id": scene_id, "element_id": element["id"], "element_name": element["name"],
                         "from_shot_id": prev_shot["id"], "to_shot_id": shot["id"], "kind": kind,
                         "detail": detail, "fingerprint": fingerprint,
+                        "from_version": prev["version"], "to_version": current["version"],
                     })
         return detected
 
@@ -349,14 +449,16 @@ class ContinuityDB:
             if existing:
                 status = "exempted" if existing["status"] == "exempted" else "open"
                 self.conn.execute(
-                    "UPDATE conflicts SET active=1,status=?,detail=?,updated_at=? WHERE id=?",
-                    (status, issue["detail"], datetime.now().isoformat(), existing["id"]),
+                    "UPDATE conflicts SET active=1,status=?,detail=?,from_version=?,to_version=?,updated_at=? WHERE id=?",
+                    (status, issue["detail"], issue["from_version"], issue["to_version"], datetime.now().isoformat(), existing["id"]),
                 )
             else:
                 self.conn.execute(
-                    "INSERT INTO conflicts(scene_id,element_id,from_shot_id,to_shot_id,kind,detail,status,active,fingerprint,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?, 'open',1,?,?,?)",
-                    (issue["scene_id"], issue["element_id"], issue["from_shot_id"], issue["to_shot_id"], issue["kind"], issue["detail"], issue["fingerprint"], datetime.now().isoformat(), datetime.now().isoformat()),
+                    "INSERT INTO conflicts(scene_id,element_id,from_shot_id,to_shot_id,kind,detail,from_version,to_version,status,active,fingerprint,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?, 'open',1,?,?,?)",
+                    (issue["scene_id"], issue["element_id"], issue["from_shot_id"], issue["to_shot_id"], issue["kind"],
+                     issue["detail"], issue["from_version"], issue["to_version"], issue["fingerprint"],
+                     datetime.now().isoformat(), datetime.now().isoformat()),
                 )
 
     def check_scene(self, scene_id: int) -> list[dict]:
@@ -375,7 +477,7 @@ class ContinuityDB:
         ).fetchall()]
 
     def propose_adjustment(self, conflict_id: int, new_value: str, numeric_value: float | None,
-                           reason: str, user_id: int) -> int:
+                           reason: str, user_id: int, shoot_date: str) -> int:
         conflict = self.conn.execute("SELECT * FROM conflicts WHERE id=?", (conflict_id,)).fetchone()
         if not conflict or not conflict["active"]:
             raise DomainError("冲突不存在或已解决")
@@ -386,18 +488,17 @@ class ContinuityDB:
         user = self._production_for_user(element["production_id"], user_id)
         if user["role"] not in {"producer", "continuity"}:
             raise DomainError("无权提出调整方案")
-        if shot["status"] == "locked":
-            raise DomainError("目标镜头已锁定")
         if not new_value.strip() or len(reason.strip()) < 3:
             raise DomainError("新状态和调整理由必须填写")
         if element["rule"] == "monotonic" and numeric_value is None:
             raise DomainError("单调规则调整必须提供 numeric_value")
+        shoot_date = self._check_shoot_date(shoot_date)
         with self.transaction():
             try:
                 cur = self.conn.execute(
-                    "INSERT INTO adjustment_plans(conflict_id,shot_id,element_id,new_value,numeric_value,reason,proposed_by,proposed_at) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (conflict_id, shot["id"], element["id"], new_value.strip(), numeric_value, reason.strip(), user_id, datetime.now().isoformat()),
+                    "INSERT INTO adjustment_plans(conflict_id,shot_id,element_id,new_value,numeric_value,reason,shoot_date,proposed_by,proposed_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (conflict_id, shot["id"], element["id"], new_value.strip(), numeric_value, reason.strip(), shoot_date, user_id, datetime.now().isoformat()),
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("该冲突已有调整方案") from exc
@@ -413,8 +514,6 @@ class ContinuityDB:
         if plan["proposed_by"] == reviewer_id:
             raise DomainError("提案人不能审核自己的方案")
         shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (plan["shot_id"],)).fetchone()
-        if shot["status"] == "locked":
-            raise DomainError("目标镜头已锁定")
         with self.transaction():
             status = "approved" if approve else "rejected"
             self.conn.execute(
@@ -422,16 +521,13 @@ class ContinuityDB:
                 (status, reviewer_id, note.strip(), datetime.now().isoformat(), plan_id),
             )
             if approve:
-                try:
-                    self.conn.execute(
-                        "INSERT INTO element_states(shot_id,element_id,state_value,numeric_value,note,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
-                        (plan["shot_id"], plan["element_id"], plan["new_value"], plan["numeric_value"], f"调整方案 #{plan_id}", reviewer_id, datetime.now().isoformat()),
-                    )
-                except sqlite3.IntegrityError:
-                    self.conn.execute(
-                        "UPDATE element_states SET state_value=?,numeric_value=?,note=?,updated_by=?,updated_at=? WHERE shot_id=? AND element_id=?",
-                        (plan["new_value"], plan["numeric_value"], f"调整方案 #{plan_id}", reviewer_id, datetime.now().isoformat(), plan["shot_id"], plan["element_id"]),
-                    )
+                version, _ = self._record_state_version(
+                    shot, plan["element_id"], plan["new_value"], plan["numeric_value"],
+                    f"调整方案 #{plan_id}", plan["shoot_date"], plan["reason"], "plan", plan_id, reviewer_id,
+                )
+                self._release_scene_locks(
+                    shot["scene_id"], f"镜头 {shot['shot_code']} 按调整方案 #{plan_id} 生成版本 v{version}"
+                )
                 self.conn.execute(
                     "UPDATE conflicts SET active=0,status='resolved',updated_at=? WHERE id=?",
                     (datetime.now().isoformat(), plan["conflict_id"]),
@@ -457,13 +553,15 @@ class ContinuityDB:
             self.conn.execute("UPDATE conflicts SET status='exempted',updated_at=? WHERE id=?", (datetime.now().isoformat(), conflict_id))
         return int(cur.lastrowid)
 
-    def lock_shot(self, shot_id: int, user_id: int) -> None:
+    def lock_shot(self, shot_id: int, user_id: int) -> dict:
         shot = self.conn.execute("SELECT s.*,sc.production_id FROM shots s JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (shot_id,)).fetchone()
         if not shot:
             raise DomainError("镜头不存在")
         user = self._production_for_user(shot["production_id"], user_id)
         if user["role"] not in {"producer", "continuity"}:
             raise DomainError("无权锁定镜头")
+        if shot["status"] == "locked":
+            raise DomainError("镜头已锁定")
         with self.transaction():
             self._sync_conflicts(shot["scene_id"])
             blocking = self.conn.execute(
@@ -471,7 +569,16 @@ class ContinuityDB:
             ).fetchone()[0]
             if blocking:
                 raise DomainError(f"场次仍有 {blocking} 个未处理冲突，不能锁定")
-            self.conn.execute("UPDATE shots SET status='locked',version=version+1,updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), shot_id))
+            cur = self.conn.execute(
+                "INSERT INTO shot_locks(shot_id,shot_version,locked_by,locked_at) VALUES(?,?,?,?)",
+                (shot_id, shot["version"], user_id, datetime.now().isoformat()),
+            )
+            self.conn.execute(
+                "UPDATE shots SET status='locked',status_note='',updated_by=?,updated_at=? WHERE id=?",
+                (user_id, datetime.now().isoformat(), shot_id),
+            )
+            lock_id = int(cur.lastrowid)
+        return {"shot_id": shot_id, "lock_id": lock_id, "version": shot["version"]}
 
     def continuity_report(self, production_id: int) -> dict:
         production = self.conn.execute("SELECT * FROM productions WHERE id=?", (production_id,)).fetchone()
@@ -479,7 +586,20 @@ class ContinuityDB:
             raise DomainError("项目不存在")
         scenes = []
         for scene in self.conn.execute("SELECT * FROM scenes WHERE production_id=? ORDER BY narrative_order", (production_id,)).fetchall():
-            shots = [dict(r) for r in self.conn.execute("SELECT * FROM shots WHERE scene_id=? ORDER BY narrative_order", (scene["id"],))]
+            shots = []
+            for row in self.conn.execute("SELECT * FROM shots WHERE scene_id=? ORDER BY narrative_order", (scene["id"],)).fetchall():
+                shot = dict(row)
+                shot["states"] = [dict(s) for s in self.conn.execute(
+                    "SELECT es.*,e.name AS element_name,u.name AS updated_by_name FROM element_states es "
+                    "JOIN elements e ON e.id=es.element_id JOIN users u ON u.id=es.updated_by "
+                    "WHERE es.shot_id=? AND es.status='enabled' ORDER BY es.element_id", (shot["id"],)
+                ).fetchall()]
+                lock = self.conn.execute(
+                    "SELECT l.*,u.name AS locked_by_name FROM shot_locks l JOIN users u ON u.id=l.locked_by "
+                    "WHERE l.shot_id=? AND l.status='active' ORDER BY l.id DESC", (shot["id"],)
+                ).fetchone()
+                shot["active_lock"] = dict(lock) if lock else None
+                shots.append(shot)
             conflicts = self.list_conflicts(scene["id"], include_resolved=True)
             scenes.append({**dict(scene), "shots": shots, "conflicts": conflicts})
         return {
@@ -496,4 +616,6 @@ class ContinuityDB:
             "productions": [dict(r) for r in self.conn.execute("SELECT * FROM productions ORDER BY id")],
             "scenes": [dict(r) for r in self.conn.execute("SELECT * FROM scenes ORDER BY production_id,narrative_order")],
             "shots": [dict(r) for r in self.conn.execute("SELECT * FROM shots ORDER BY scene_id,narrative_order")],
+            "elements": [dict(r) for r in self.conn.execute("SELECT * FROM elements ORDER BY production_id,id")],
+            "locks": [dict(r) for r in self.conn.execute("SELECT * FROM shot_locks ORDER BY id")],
         }
